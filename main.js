@@ -2,11 +2,6 @@ var jarvis = {};
 
 jarvis.config = require('./config.js');
 
-var WITAI_HOST = 'localhost';
-var WITAI_PORT = 9877
-var WITAI_START = '/start?access_token=' + jarvis.config.witai.clientToken;
-var WITAI_STOP = '/stop';
-var WITAI_TEXT = '/text?q={query}&access_token=' + jarvis.config.witai.clientToken;
 var TelegramBot = require('node-telegram-bot-api');
 
 /*
@@ -19,27 +14,33 @@ jarvis.spotify = require('spotify')({
 jarvis.telegram = new TelegramBot(jarvis.config.telegram.token, {polling: true});
 jarvis.speak = require('say').speak;
 jarvis.repl = require("repl");
-var http = require('http');
-
+var Witai = require("./wit.ai.js");
+var sys = require('sys')
+var exec = require('child_process').exec;
 
 /*
  * Initialize components
  */ 
 jarvis.init= function(){
 	jarvis.mode = 'idle';
+	jarvis.volume = 75;
 
 	jarvis.initSpotify();
 	jarvis.initTelegram();
+	jarvis.wit = new Witai(jarvis.config.witai.host, jarvis.config.witai.port, jarvis.config.witai.clientToken);
 
-	//jarvis.listen();
-	jarvis.read();
+	jarvis.listen();
+
+	//read eval print loop
+	jarvis.startRepl();
 }
 
 /*
  * Jarvis methods
  */ 
 
-jarvis.read = function(){
+jarvis.startRepl = function(){
+	
 	jarvis.repl.start({
 	    prompt: "jarvis:~$ ",
 	    eval: function(input, context, filename, replCallback){
@@ -64,119 +65,120 @@ jarvis.interpretText = function(input, callback){
 		return null;
 	}
 
-	var witaiTextPath = WITAI_TEXT.replace('{query}', input);
-	var options = {
-		host: WITAI_HOST,
-	    port: WITAI_PORT,
-	    path: witaiTextPath,
-	    method: 'GET',
-	    headers: {
-	        'Content-Type': 'application/json'
-	    }
-	};
-
-	jarvis.interpretTextReq = http.request(options, function(res){
-		var output = '';
-		res.setEncoding('utf8');
-
-		res.on('data', function (chunk) {
-            output += chunk;
-        });
-
-        res.on('end', function() {
-        	jarvis.processIntent(JSON.parse(output), callback);
-        });
+	jarvis.wit.text(input, {
+		onEnd: function(output){
+			jarvis.processIntent(JSON.parse(output), callback);
+		}, 
+		onError : function(){
+			callback('Error in witai request');
+		}
 	});
 
-	jarvis.interpretTextReq.on('error', function(){
-		callback('Error in witai request');
-	});
-
-	jarvis.interpretTextReq.end();
-};
-
-jarvis.listen = function(){
-
-	var options = {
-		host: WITAI_HOST,
-	    port: WITAI_PORT,
-	    path: WITAI_START,
-	    method: 'GET',
-	    headers: {
-	        'Content-Type': 'application/json'
-	    }
-	};
 	
-	jarvis.listenReq = http.request(options, function(res){
-		
-		var output = '';
-		res.setEncoding('utf8');
-
-		res.on('data', function (chunk) {
-            output += chunk;
-        });
-
-        res.on('end', function() {
-        	return jarvis.processIntent(JSON.parse(output));
-        });
-
-	});
-
-	jarvis.listenReq.on('error', function(){
-		return 'Error in witai request';
-	});
-
-	jarvis.listenReq.end();
-
-	setTimeout(function(){
-		jarvis.stopListening();
-		jarvis.listen();
-	}, 2000);
 };
 
-jarvis.stopListening = function(){
-	jarvis.stopListeningReq = http.request({
-		host: WITAI_HOST,
-		port: WITAI_PORT,
-		path: WITAI_STOP,
-		method: 'GET'
+jarvis.listen = function(callback){
+
+	jarvis.wit.start({
+		onEnd: function(output){
+			setTimeout(function(){
+				jarvis.stopListening(function(output){
+					jarvis.say(output);
+				});
+				jarvis.setVolume(jarvis.volume);
+			}, 2000);
+		},
+		onError: function(){
+			console.log('Error in witai request');
+			jarvis.say('Error in witai request');
+		}
 	});
 
-	jarvis.stopListeningReq.on('error', function(){
-		jarvis.say('Error in witai request');
+};
+
+jarvis.stopListening = function(callback){
+	
+	jarvis.wit.stop({
+		onEnd: function(output){
+			if(output){
+				var outputObject;
+				try{
+					outputObject = JSON.parse(output);
+				}catch(e){
+					console.log(output);
+				}
+				jarvis.processIntent(outputObject, callback);
+			}
+			jarvis.listen(); //Start listening again
+		},
+		onError: function(){
+			jarvis.say('Error in witai request');
+		}
 	});
 
-	jarvis.stopListeningReq.end();
 };
 
 jarvis.say = function(something){ //I'm giving up on you
 	if(something){
-		console.log(something);
 		jarvis.speak(null, something);
+		console.log(something);
 	}
+};
+
+jarvis.isAwake = function(){
+	return jarvis.mode == 'awake';
+};
+
+jarvis.shellCommand = function(command){
+	exec(command, puts);
+};
+
+jarvis.setVolume = function(volume){
+	jarvis.volume = volume;
+	jarvis.shellCommand("vol " + jarvis.volume);
 };
 
 jarvis.processIntent = function(command, callback){
 	
-	if(command.outcomes && command.outcomes.length){
+	if(command && command.outcomes && command.outcomes.length){
 		var outcome = command.outcomes[0];
 		var intent = outcome.intent;
+		
+		//just awake commands
+		if(jarvis.isAwake()){	
+			switch(intent){
+				case 'play':
+					jarvis.setVolume(jarvis.volume);
+					if(outcome.entities && outcome.entities.music_text.length
+						&& command._text.indexOf('play') != -1){
 
+						var musicText = outcome.entities.music_text[0].value;
+						jarvis.findMusic(musicText, callback);
+					}
+					break;
+			}
+		}
+
+		//all mode mode commands
 		switch(intent){
+			case 'pause':
+				jarvis.stopMusic(callback);
+				break;
 			case 'greeting':
 				jarvis.mode = 'awake';
 				jarvis.sayHi(callback);
+				jarvis.shellCommand('vol 20');
 				break;
-			case 'play':
-				var musicText = outcome.entities.music_text[0].value;
-				result = jarvis.findMusic(musicText, callback);
-				break;
-			case 'pause':
-				result = jarvis.stopMusic(callback);
-				break;
+			case 'volume':
+				//TODO improve
+				if(outcome.entities && outcome.entities.number.length){
+					var number = outcome.entities.number[0].value;
+					jarvis.setVolume(number, callback);
+				}
 		}
+		
 	}
-}
+};
 
 jarvis.sayHi = function(callback){
 	var greetings = ['Yes, sir', 'Hello', 'What can I do for you?'];
@@ -210,6 +212,7 @@ jarvis.playTracks = function(track, callback){
 		jarvis.spotify.player.play(track);
 	}, 2000);
 
+	jarvis.mode = 'idle';
 	callback('Playing ' + songName + ' by ' + artist);
 
 };
@@ -260,4 +263,10 @@ Array.prototype.contains = function(obj) {
         }
     }
     return false;
+}
+
+function puts(error, stdout, stderr) {
+	if(error){
+		sys.puts(error);
+	}
 }

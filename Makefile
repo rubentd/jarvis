@@ -3,4 +3,4 @@ witai:
 	
 
 jarvis:
-	node main.js
+	@node main.js
