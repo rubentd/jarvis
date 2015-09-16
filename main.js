@@ -14,23 +14,22 @@ jarvis.spotify = require('spotify')({
 jarvis.telegram = new TelegramBot(jarvis.config.telegram.token, {polling: true});
 jarvis.speak = require('say').speak;
 jarvis.repl = require("repl");
-var Witai = require("./wit.ai.js");
+Playlist = require('./playlist.js');
+var wit = require('node-wit');
+var fs = require('fs');
 var sys = require('sys')
 var exec = require('child_process').exec;
+
 
 /*
  * Initialize components
  */ 
 jarvis.init= function(){
-	jarvis.mode = 'idle';
-	jarvis.volume = 75;
+	jarvis.volume = 70;
 
 	jarvis.initSpotify();
 	jarvis.initTelegram();
-	jarvis.wit = new Witai(jarvis.config.witai.host, jarvis.config.witai.port, jarvis.config.witai.clientToken);
-
-	jarvis.listen();
-
+	
 	//read eval print loop
 	jarvis.startRepl();
 }
@@ -54,69 +53,45 @@ jarvis.startRepl = function(){
 jarvis.initSpotify = function(){
 	jarvis.spotify.login(jarvis.config.spotify.user, jarvis.config.spotify.pass, false, false);
 	jarvis.spotify.on({
-	    ready: function(){}
+	    ready: function(){
+	    	jarvis.playlists = jarvis.spotify.playlistContainer.getPlaylists();
+	    }
 	});
 }
 
 jarvis.interpretText = function(input, callback){
 	
-	input = input.replace('(', '').replace(')', '').replace('\n', '').replace(/ /g, '+');
+	input = input.replace('(', '').replace(')', '').replace('\n', '').toLowerCase();
 	if(!input){
 		return null;
 	}
 
-	jarvis.wit.text(input, {
-		onEnd: function(output){
-			jarvis.processIntent(JSON.parse(output), callback);
-		}, 
-		onError : function(){
-			callback('Error in witai request');
-		}
-	});
-
+	wit.captureTextIntent(jarvis.config.wit.clientToken, input, function (err, res) {
+      	if (err) {
+      		callback("Error. " + err);
+      	}
+      	if(res){
+      		jarvis.processIntent(res, callback);
+      	}else{
+      		callback('Sorry, I didn\'t get that');
+      	}
+  	});
 	
 };
 
-jarvis.listen = function(callback){
-
-	jarvis.wit.start({
-		onEnd: function(output){
-			setTimeout(function(){
-				jarvis.stopListening(function(output){
-					jarvis.say(output);
-				});
-				jarvis.setVolume(jarvis.volume);
-			}, 2000);
-		},
-		onError: function(){
-			console.log('Error in witai request');
-			jarvis.say('Error in witai request');
-		}
-	});
-
-};
-
-jarvis.stopListening = function(callback){
-	
-	jarvis.wit.stop({
-		onEnd: function(output){
-			if(output){
-				var outputObject;
-				try{
-					outputObject = JSON.parse(output);
-				}catch(e){
-					console.log(output);
-				}
-				jarvis.processIntent(outputObject, callback);
-			}
-			jarvis.listen(); //Start listening again
-		},
-		onError: function(){
-			jarvis.say('Error in witai request');
-		}
-	});
-
-};
+jarvis.interpretAudio = function(audioFileName, callback){
+	var stream = fs.createReadStream(audioFileName);
+  	wit.captureSpeechIntent(jarvis.config.clientToken, stream, "audio/wav", function (err, res) {
+      	if (err) {
+      		callback("Error. " + err);
+      	}
+      	if(res){
+      		jarvis.processIntent(res, callback);
+      	}else{
+      		callback('Sorry, I didn\'t get that');
+      	}
+  	});
+}
 
 jarvis.say = function(something){ //I'm giving up on you
 	if(something){
@@ -125,17 +100,15 @@ jarvis.say = function(something){ //I'm giving up on you
 	}
 };
 
-jarvis.isAwake = function(){
-	return jarvis.mode == 'awake';
-};
 
 jarvis.shellCommand = function(command){
 	exec(command, puts);
 };
 
-jarvis.setVolume = function(volume){
+jarvis.setVolume = function(volume, callback){
 	jarvis.volume = volume;
 	jarvis.shellCommand("vol " + jarvis.volume);
+	callback('Volume set to ' + jarvis.volume);
 };
 
 jarvis.processIntent = function(command, callback){
@@ -143,45 +116,71 @@ jarvis.processIntent = function(command, callback){
 	if(command && command.outcomes && command.outcomes.length){
 		var outcome = command.outcomes[0];
 		var intent = outcome.intent;
-		
-		//just awake commands
-		if(jarvis.isAwake()){	
-			switch(intent){
-				case 'play':
-					jarvis.setVolume(jarvis.volume);
-					if(outcome.entities && outcome.entities.music_text.length
-						&& command._text.indexOf('play') != -1){
 
-						var musicText = outcome.entities.music_text[0].value;
+		console.log(command);
+		
+		switch(intent){
+			case 'play':
+				if(outcome && outcome.entities && outcome.entities.music_text.length
+					&& command._text.toLowerCase().indexOf('play') != -1){
+
+					var musicText = outcome.entities.music_text[0].value;
+					//Check playlists first
+					var list = jarvis.getPlaylist(musicText);
+					if(list){
+						jarvis.playlist = new Playlist(list, jarvis.spotify.player, callback);
+					}else{
+						//find music
 						jarvis.findMusic(musicText, callback);
 					}
-					break;
-			}
-		}
-
-		//all mode mode commands
-		switch(intent){
+				}
+				break;
 			case 'pause':
-				jarvis.stopMusic(callback);
+				if(jarvis.playlist){
+					jarvis.playlist.pause();
+				}
+				break;
+			case 'unpause':
+				if(jarvis.playlist){
+					jarvis.playlist.resume();
+				}
+				break;
+			case 'next':
+				if(jarvis.playlist){
+					jarvis.playlist.next();
+				}
+				break;
+			case 'prev':
+				if(jarvis.playlist){
+					jarvis.playlist.prev();
+				}
 				break;
 			case 'greeting':
-				jarvis.mode = 'awake';
 				jarvis.sayHi(callback);
-				jarvis.shellCommand('vol 20');
 				break;
 			case 'volume':
-				//TODO improve
-				if(outcome.entities && outcome.entities.number.length){
+				if(outcome && outcome.entities && outcome.entities.number && outcome.entities.number.length){
 					var number = outcome.entities.number[0].value;
 					jarvis.setVolume(number, callback);
 				}
+				break;
 		}
 		
 	}
 };
 
+jarvis.getPlaylist= function(name){
+	for(var i = 0; i < jarvis.playlists.length; i++){
+		var plName = jarvis.playlists[i].name;
+		if(plName && plName.toLowerCase() == name.toLowerCase()){
+			return jarvis.playlists[i];
+		}
+	}
+	return null;
+}
+
 jarvis.sayHi = function(callback){
-	var greetings = ['Yes, sir', 'Hello', 'What can I do for you?'];
+	var greetings = ['What can I help you with?', 'Hello', 'What can I do for you?'];
 	var r = getRandomInt(0, greetings.length - 1);
 	callback(greetings[r]);
 }
@@ -192,10 +191,8 @@ jarvis.findMusic = function(song, callback){
 	
 	search.execute( function(err, searchResult) {
 		
-		var track = searchResult.getTrack(0);
-		
-		if(track){
-			jarvis.playTracks(track, callback);
+		if(searchResult.totalTracks > 0){
+			jarvis.playlist = new Playlist(searchResult, jarvis.spotify.player, callback);
 		}else{
 			callback('Music not found');
 		}
@@ -204,40 +201,34 @@ jarvis.findMusic = function(song, callback){
 
 };
 
-jarvis.playTracks = function(track, callback){
-	var songName = track.name;
-	var artist = track.artists[0].name;
-	
-	setTimeout( function(){
-		jarvis.spotify.player.play(track);
-	}, 2000);
-
-	jarvis.mode = 'idle';
-	callback('Playing ' + songName + ' by ' + artist);
-
-};
-
 jarvis.stopMusic = function(callback){
-	jarvis.spotify.player.stop();
-	callback('Music stopped');
+	if(jarvis.playlist){
+		jarvis.playlist.stop();
+	}
 }
 
 jarvis.initTelegram = function(){
 
-	jarvis.telegram.on('text', function (msg) {
+	jarvis.telegram.on('message', function (msg) {
 
-		var cmd = msg.text;
 		var chatId = msg.chat.id;
 
 		if(jarvis.checkTelegramUser(msg.from.username)){
-			jarvis.interpretText(cmd, function(response){
-				console.log(response);
-				jarvis.telegram.sendMessage(chatId, response);
-			});
-
+			
+			if(msg.text){
+				jarvis.interpretText(msg.text, function(response){
+					console.log(response);
+					jarvis.telegram.sendMessage(chatId, response);
+				});
+			}else if(msg.voice){
+				var fileId = msg.voice.file_id;
+				console.log('audio file ');
+			}
+			
 		}else{
 			jarvis.telegram.sendMessage(chatId, 'Sorry, I don\'t know you');
 		}
+
 
 	});
 };
@@ -247,6 +238,7 @@ jarvis.checkTelegramUser = function(username){
 }
 
 jarvis.init();
+
 
 
 
